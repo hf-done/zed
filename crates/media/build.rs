@@ -2,6 +2,8 @@
 fn main() {
     use std::{env, path::PathBuf, process::Command};
 
+    let target = std::env::var("TARGET").expect("unable to get target from ENV");
+
     let sdk_path = String::from_utf8(
         Command::new("xcrun")
             .args(["--sdk", "macosx", "--show-sdk-path"])
@@ -15,6 +17,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/bindings.h");
     let bindings = bindgen::Builder::default()
         .header("src/bindings.h")
+        .clang_arg(format!("--target={}", target))
+        .clang_arg("-DTARGET_OS_OSX=1")
         .clang_arg(format!("-isysroot{}", sdk_path))
         .clang_arg("-xobjective-c")
         .allowlist_type("CMItemIndex")
