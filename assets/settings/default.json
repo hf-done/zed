@@ -545,6 +545,12 @@
   "file_types": {},
   // Different settings for specific languages.
   "languages": {
+    "C++": {
+      "format_on_save": "off"
+    },
+    "C": {
+      "format_on_save": "off"
+    },
     "Plain Text": {
       "soft_wrap": "preferred_line_length"
     },
@@ -597,7 +603,7 @@
     }
   },
   // Zed's Prettier integration settings.
-  // If Prettier is enabled, Zed will use this its Prettier instance for any applicable file, if
+  // If Prettier is enabled, Zed will use this for its Prettier instance for any applicable file, if
   // project has no other Prettier installed.
   "prettier": {
     // Use regular Prettier json configuration:

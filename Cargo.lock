@@ -5338,7 +5338,6 @@ dependencies = [
  "tree-sitter-c",
  "tree-sitter-cpp",
  "tree-sitter-css",
- "tree-sitter-dart",
  "tree-sitter-elixir",
  "tree-sitter-elm",
  "tree-sitter-embedded-template",
@@ -5680,6 +5679,7 @@ dependencies = [
  "editor",
  "gpui",
  "language",
+ "linkify",
  "pretty_assertions",
  "pulldown-cmark",
  "theme",
@@ -9500,7 +9500,6 @@ dependencies = [
  "gpui",
  "itertools 0.11.0",
  "language",
- "menu",
  "picker",
  "project",
  "serde",
@@ -10212,15 +10211,6 @@ dependencies = [
 name = "tree-sitter-css"
 version = "0.19.0"
 source = "git+https://github.com/tree-sitter/tree-sitter-css?rev=769203d0f9abe1a9a691ac2b9fe4bb4397a73c51#769203d0f9abe1a9a691ac2b9fe4bb4397a73c51"
-dependencies = [
- "cc",
- "tree-sitter",
-]
-
-[[package]]
-name = "tree-sitter-dart"
-version = "0.0.1"
-source = "git+https://github.com/agent3bood/tree-sitter-dart?rev=48934e3bf757a9b78f17bdfaa3e2b4284656fdc7#48934e3bf757a9b78f17bdfaa3e2b4284656fdc7"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -12491,6 +12481,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zed_dart"
+version = "0.0.1"
+dependencies = [
+ "zed_extension_api 0.0.6",
+]
+
+[[package]]
 name = "zed_emmet"
 version = "0.0.1"
 dependencies = [
@@ -12516,13 +12513,6 @@ dependencies = [
 [[package]]
 name = "zed_extension_api"
 version = "0.0.5"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
-name = "zed_extension_api"
-version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5f4ae4e302a80591635ef9a236b35fde6fcc26cfd060e66fde4ba9f9fd394a1"
 dependencies = [
@@ -12530,17 +12520,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zed_extension_api"
+version = "0.0.6"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "zed_gleam"
 version = "0.0.2"
 dependencies = [
- "zed_extension_api 0.0.4",
+ "zed_extension_api 0.0.6",
 ]
 
 [[package]]
 name = "zed_haskell"
 version = "0.0.1"
 dependencies = [
- "zed_extension_api 0.0.4",
+ "zed_extension_api 0.0.6",
 ]
 
 [[package]]
@@ -12575,14 +12574,14 @@ dependencies = [
 name = "zed_svelte"
 version = "0.0.1"
 dependencies = [
- "zed_extension_api 0.0.4",
+ "zed_extension_api 0.0.6",
 ]
 
 [[package]]
 name = "zed_toml"
 version = "0.0.2"
 dependencies = [
- "zed_extension_api 0.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zed_extension_api 0.0.5",
 ]
 
 [[package]]
@@ -12596,7 +12595,7 @@ dependencies = [
 name = "zed_zig"
 version = "0.0.1"
 dependencies = [
- "zed_extension_api 0.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zed_extension_api 0.0.5",
 ]
 
 [[package]]

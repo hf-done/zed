@@ -1,5 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
+use crate::{active_item_selection_properties, schedule_task};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     impl_actions, rems, AppContext, DismissEvent, EventEmitter, FocusableView, InteractiveElement,
@@ -10,7 +11,7 @@ use picker::{
     highlighted_match_with_paths::{HighlightedMatchWithPaths, HighlightedText},
     Picker, PickerDelegate,
 };
-use project::{Inventory, ProjectPath, TaskSourceKind};
+use project::{Inventory, TaskSourceKind};
 use task::{oneshot_source::OneshotSource, Task, TaskContext};
 use ui::{
     div, v_flex, ButtonCommon, ButtonSize, Clickable, Color, FluentBuilder as _, IconButton,
@@ -20,7 +21,6 @@ use ui::{
 use util::{paths::PathExt, ResultExt};
 use workspace::{ModalView, Workspace};
 
-use crate::schedule_task;
 use serde::Deserialize;
 
 /// Spawn a task with name or open tasks modal
@@ -55,6 +55,7 @@ pub(crate) struct TasksModalDelegate {
     workspace: WeakView<Workspace>,
     prompt: String,
     task_context: TaskContext,
+    placeholder_text: Arc<str>,
 }
 
 impl TasksModalDelegate {
@@ -71,6 +72,7 @@ impl TasksModalDelegate {
             selected_index: 0,
             prompt: String::default(),
             task_context,
+            placeholder_text: Arc::from("Run a task..."),
         }
     }
 
@@ -113,20 +115,6 @@ impl TasksModalDelegate {
             });
             Some(())
         });
-    }
-    fn active_item_path(
-        workspace: &WeakView<Workspace>,
-        cx: &mut ViewContext<'_, Picker<Self>>,
-    ) -> Option<(PathBuf, ProjectPath)> {
-        let workspace = workspace.upgrade()?.read(cx);
-        let project = workspace.project().read(cx);
-        let active_item = workspace.active_item(cx)?;
-        active_item.project_path(cx).and_then(|project_path| {
-            project
-                .worktree_for_id(project_path.worktree_id, cx)
-                .map(|worktree| worktree.read(cx).abs_path().join(&project_path.path))
-                .zip(Some(project_path))
-        })
     }
 }
 
@@ -197,13 +185,8 @@ impl PickerDelegate for TasksModalDelegate {
         self.selected_index = ix;
     }
 
-    fn placeholder_text(&self, cx: &mut WindowContext) -> Arc<str> {
-        Arc::from(format!(
-            "{} use task name as prompt, {} spawns a bash-like task from the prompt, {} runs the selected task",
-            cx.keystroke_text_for(&picker::UseSelectedQuery),
-            cx.keystroke_text_for(&picker::ConfirmInput {secondary: false}),
-            cx.keystroke_text_for(&menu::Confirm),
-        ))
+    fn placeholder_text(&self, _: &mut WindowContext) -> Arc<str> {
+        self.placeholder_text.clone()
     }
 
     fn update_matches(
@@ -215,15 +198,10 @@ impl PickerDelegate for TasksModalDelegate {
             let Some(candidates) = picker
                 .update(&mut cx, |picker, cx| {
                     let candidates = picker.delegate.candidates.get_or_insert_with(|| {
-                        let (path, worktree) =
-                            match Self::active_item_path(&picker.delegate.workspace, cx) {
-                                Some((abs_path, project_path)) => {
-                                    (Some(abs_path), Some(project_path.worktree_id))
-                                }
-                                None => (None, None),
-                            };
+                        let (worktree, language) =
+                            active_item_selection_properties(&picker.delegate.workspace, cx);
                         picker.delegate.inventory.update(cx, |inventory, cx| {
-                            inventory.list_tasks(path.as_deref(), worktree, true, cx)
+                            inventory.list_tasks(language, worktree, true, cx)
                         })
                     });
 
@@ -286,7 +264,7 @@ impl PickerDelegate for TasksModalDelegate {
             .update(cx, |workspace, cx| {
                 schedule_task(
                     workspace,
-                    task.as_ref(),
+                    &task,
                     self.task_context.clone(),
                     omit_history_entry,
                     cx,
@@ -311,7 +289,7 @@ impl PickerDelegate for TasksModalDelegate {
         let (source_kind, _) = &candidates.get(hit.candidate_id)?;
         let details = match source_kind {
             TaskSourceKind::UserInput => "user input".to_string(),
-            TaskSourceKind::Buffer => "language extension".to_string(),
+            TaskSourceKind::Language { name } => format!("{name} language"),
             TaskSourceKind::Worktree { abs_path, .. } | TaskSourceKind::AbsPath(abs_path) => {
                 abs_path.compact().to_string_lossy().to_string()
             }
@@ -366,9 +344,7 @@ impl PickerDelegate for TasksModalDelegate {
         let task_index = self.matches.get(self.selected_index())?.candidate_id;
         let tasks = self.candidates.as_ref()?;
         let (_, task) = tasks.get(task_index)?;
-        // .exec doesn't actually spawn anything; it merely prepares a spawning command,
-        // which we can use for substitution.
-        let mut spawn_prompt = task.exec(self.task_context.clone())?;
+        let mut spawn_prompt = task.prepare_exec(self.task_context.clone())?;
         if !spawn_prompt.args.is_empty() {
             spawn_prompt.command.push(' ');
             spawn_prompt
@@ -386,7 +362,7 @@ impl PickerDelegate for TasksModalDelegate {
             .update(cx, |workspace, cx| {
                 schedule_task(
                     workspace,
-                    task.as_ref(),
+                    &task,
                     self.task_context.clone(),
                     omit_history_entry,
                     cx,
