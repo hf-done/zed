@@ -31,9 +31,8 @@ use gpui::{
 use ignore::IgnoreStack;
 use itertools::Itertools;
 use language::{
-    proto::{deserialize_version, serialize_fingerprint, serialize_line_ending, serialize_version},
-    Buffer, Capability, DiagnosticEntry, File as _, LineEnding, PointUtf16, Rope, RopeFingerprint,
-    Unclipped,
+    proto::{deserialize_version, serialize_line_ending, serialize_version},
+    Buffer, Capability, DiagnosticEntry, File as _, LineEnding, PointUtf16, Rope, Unclipped,
 };
 use lsp::{DiagnosticSeverity, LanguageServerId};
 use parking_lot::Mutex;
@@ -1175,7 +1174,6 @@ impl LocalWorktree {
         }
 
         let text = buffer.as_rope().clone();
-        let fingerprint = text.fingerprint();
         let version = buffer.version();
         let save = self.write_file(path.as_ref(), text, buffer.line_ending(), cx);
         let fs = Arc::clone(&self.fs);
@@ -1238,12 +1236,11 @@ impl LocalWorktree {
                     buffer_id,
                     version: serialize_version(&version),
                     mtime: mtime.map(|time| time.into()),
-                    fingerprint: serialize_fingerprint(fingerprint),
                 })?;
             }
 
             buffer_handle.update(&mut cx, |buffer, cx| {
-                buffer.did_save(version.clone(), fingerprint, mtime, cx);
+                buffer.did_save(version.clone(), mtime, cx);
             })?;
 
             Ok(())
@@ -1644,11 +1641,10 @@ impl RemoteWorktree {
                 })
                 .await?;
             let version = deserialize_version(&response.version);
-            let fingerprint = RopeFingerprint::default();
             let mtime = response.mtime.map(|mtime| mtime.into());
 
             buffer_handle.update(&mut cx, |buffer, cx| {
-                buffer.did_save(version.clone(), fingerprint, mtime, cx);
+                buffer.did_save(version.clone(), mtime, cx);
             })?;
 
             Ok(())
@@ -1999,10 +1995,10 @@ impl Snapshot {
         let mut repositories = self.repositories().peekable();
         entries.map(move |entry| {
             while let Some((repo_path, _)) = containing_repos.last() {
-                if !entry.path.starts_with(repo_path) {
-                    containing_repos.pop();
-                } else {
+                if entry.path.starts_with(repo_path) {
                     break;
+                } else {
+                    containing_repos.pop();
                 }
             }
             while let Some((repo_path, _)) = repositories.peek() {
@@ -2033,10 +2029,10 @@ impl Snapshot {
             let entry_to_finish = match (containing_entry, next_entry) {
                 (Some(_), None) => entry_stack.pop(),
                 (Some(containing_entry), Some(next_path)) => {
-                    if !next_path.path.starts_with(&containing_entry.path) {
-                        entry_stack.pop()
-                    } else {
+                    if next_path.path.starts_with(&containing_entry.path) {
                         None
+                    } else {
+                        entry_stack.pop()
                     }
                 }
                 (None, Some(_)) => None,
@@ -2083,7 +2079,7 @@ impl Snapshot {
             .map(|entry| &entry.path)
     }
 
-    fn child_entries<'a>(&'a self, parent_path: &'a Path) -> ChildEntriesIter<'a> {
+    pub fn child_entries<'a>(&'a self, parent_path: &'a Path) -> ChildEntriesIter<'a> {
         let mut cursor = self.entries_by_path.cursor();
         cursor.seek(&TraversalTarget::Path(parent_path), Bias::Right, &());
         let traversal = Traversal {
@@ -3030,7 +3026,6 @@ impl language::LocalFile for File {
         &self,
         buffer_id: BufferId,
         version: &clock::Global,
-        fingerprint: RopeFingerprint,
         line_ending: LineEnding,
         mtime: Option<SystemTime>,
         cx: &mut AppContext,
@@ -3044,7 +3039,6 @@ impl language::LocalFile for File {
                     buffer_id: buffer_id.into(),
                     version: serialize_version(version),
                     mtime: mtime.map(|time| time.into()),
-                    fingerprint: serialize_fingerprint(fingerprint),
                     line_ending: serialize_line_ending(line_ending) as i32,
                 })
                 .log_err();
@@ -3930,7 +3924,9 @@ impl BackgroundScanner {
                 child_entry.is_ignored = ignore_stack.is_abs_path_ignored(&child_abs_path, true);
 
                 // Avoid recursing until crash in the case of a recursive symlink
-                if !job.ancestor_inodes.contains(&child_entry.inode) {
+                if job.ancestor_inodes.contains(&child_entry.inode) {
+                    new_jobs.push(None);
+                } else {
                     let mut ancestor_inodes = job.ancestor_inodes.clone();
                     ancestor_inodes.insert(child_entry.inode);
 
@@ -3947,8 +3943,6 @@ impl BackgroundScanner {
                         scan_queue: job.scan_queue.clone(),
                         containing_repository: job.containing_repository.clone(),
                     }));
-                } else {
-                    new_jobs.push(None);
                 }
             } else {
                 child_entry.is_ignored = ignore_stack.is_abs_path_ignored(&child_abs_path, false);
@@ -4686,10 +4680,10 @@ impl<'a, 'b> SeekTarget<'a, EntrySummary, TraversalProgress<'a>> for TraversalTa
         match self {
             TraversalTarget::Path(path) => path.cmp(&cursor_location.max_path),
             TraversalTarget::PathSuccessor(path) => {
-                if !cursor_location.max_path.starts_with(path) {
-                    Ordering::Equal
-                } else {
+                if cursor_location.max_path.starts_with(path) {
                     Ordering::Greater
+                } else {
+                    Ordering::Equal
                 }
             }
             TraversalTarget::Count {
@@ -4712,7 +4706,7 @@ impl<'a, 'b> SeekTarget<'a, EntrySummary, (TraversalProgress<'a>, GitStatuses)>
     }
 }
 
-struct ChildEntriesIter<'a> {
+pub struct ChildEntriesIter<'a> {
     parent_path: &'a Path,
     traversal: Traversal<'a>,
 }
@@ -4799,10 +4793,10 @@ fn combine_git_statuses(
 ) -> Option<GitFileStatus> {
     if let Some(staged) = staged {
         if let Some(unstaged) = unstaged {
-            if unstaged != staged {
-                Some(GitFileStatus::Modified)
-            } else {
+            if unstaged == staged {
                 Some(staged)
+            } else {
+                Some(GitFileStatus::Modified)
             }
         } else {
             Some(staged)

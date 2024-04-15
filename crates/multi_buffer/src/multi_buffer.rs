@@ -418,6 +418,9 @@ impl MultiBuffer {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
+        if self.read_only() {
+            return;
+        }
         if self.buffers.borrow().is_empty() {
             return;
         }
@@ -3393,10 +3396,10 @@ impl MultiBufferSnapshot {
         cursor.seek(&range.end, Bias::Right, &());
         let end_excerpt = cursor.item()?;
 
-        if start_excerpt.id != end_excerpt.id {
-            None
-        } else {
+        if start_excerpt.id == end_excerpt.id {
             Some(MultiBufferExcerpt::new(start_excerpt, *cursor.start()))
+        } else {
+            None
         }
     }
 
