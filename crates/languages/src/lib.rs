@@ -107,10 +107,7 @@ pub fn init(
     language!("cpp", vec![Arc::new(c::CLspAdapter)]);
     language!(
         "css",
-        vec![
-            Arc::new(css::CssLspAdapter::new(node_runtime.clone())),
-            Arc::new(tailwind::TailwindLspAdapter::new(node_runtime.clone())),
-        ]
+        vec![Arc::new(css::CssLspAdapter::new(node_runtime.clone())),]
     );
     language!("go", vec![Arc::new(go::GoLspAdapter)]);
     language!("gomod");
@@ -160,13 +157,7 @@ pub fn init(
         ))]
     );
     language!("ruby", vec![Arc::new(ruby::RubyLanguageServer)]);
-    language!(
-        "erb",
-        vec![
-            Arc::new(ruby::RubyLanguageServer),
-            Arc::new(tailwind::TailwindLspAdapter::new(node_runtime.clone())),
-        ]
-    );
+    language!("erb", vec![Arc::new(ruby::RubyLanguageServer),]);
     language!("regex");
     language!(
         "yaml",
@@ -174,14 +165,46 @@ pub fn init(
     );
     language!("proto");
 
+    // Register globally available language servers.
+    //
+    // This will allow users to add support for a built-in language server (e.g., Tailwind)
+    // for a given language via the `language_servers` setting:
+    //
+    // ```json
+    // {
+    //   "languages": {
+    //     "My Language": {
+    //       "language_servers": ["tailwindcss-language-server", "..."]
+    //     }
+    //   }
+    // }
+    // ```
+    languages.register_available_lsp_adapter(
+        LanguageServerName("tailwindcss-language-server".into()),
+        {
+            let node_runtime = node_runtime.clone();
+            move || Arc::new(tailwind::TailwindLspAdapter::new(node_runtime.clone()))
+        },
+    );
+    languages.register_available_lsp_adapter(LanguageServerName("eslint".into()), {
+        let node_runtime = node_runtime.clone();
+        move || Arc::new(typescript::EsLintLspAdapter::new(node_runtime.clone()))
+    });
+
+    // Register Tailwind for the existing languages that should have it by default.
+    //
+    // This can be driven by the `language_servers` setting once we have a way for
+    // extensions to provide their own default value for that setting.
     let tailwind_languages = [
         "Astro",
+        "CSS",
+        "ERB",
         "HEEX",
         "HTML",
+        "JavaScript",
         "PHP",
         "Svelte",
         "TSX",
-        "JavaScript",
         "Vue.js",
     ];
 
@@ -192,7 +215,7 @@ pub fn init(
         );
     }
 
-    let eslint_languages = ["TSX", "TypeScript", "JavaScript", "Vue.js"];
+    let eslint_languages = ["TSX", "TypeScript", "JavaScript", "Vue.js", "Svelte"];
     for language in eslint_languages {
         languages.register_secondary_lsp_adapter(
             language.into(),

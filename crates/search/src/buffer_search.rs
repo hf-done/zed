@@ -114,7 +114,7 @@ impl BufferSearchBar {
                 color
             },
             font_family: settings.buffer_font.family.clone(),
-            font_features: settings.buffer_font.features,
+            font_features: settings.buffer_font.features.clone(),
             font_size: rems(0.875).into(),
             font_weight: FontWeight::NORMAL,
             font_style: FontStyle::Normal,
@@ -425,10 +425,6 @@ impl ToolbarItemView for BufferSearchBar {
             }
         }
         ToolbarItemLocation::Hidden
-    }
-
-    fn row_count(&self, _: &WindowContext<'_>) -> usize {
-        1
     }
 }
 

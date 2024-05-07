@@ -1,30 +1,38 @@
 mod assistant_settings;
+mod attachments;
 mod completion_provider;
-pub mod tools;
+mod tools;
+pub mod ui;
 
+use crate::{
+    attachments::ActiveEditorAttachmentTool,
+    tools::{CreateBufferTool, ProjectIndexTool},
+    ui::UserOrAssistant,
+};
+use ::ui::{div, prelude::*, Color, ViewContext};
 use anyhow::{Context, Result};
-use assistant_tooling::{ToolFunctionCall, ToolRegistry};
-use client::{proto, Client};
+use assistant_tooling::{
+    AttachmentRegistry, ProjectContext, ToolFunctionCall, ToolRegistry, UserAttachment,
+};
+use client::{proto, Client, UserStore};
+use collections::HashMap;
 use completion_provider::*;
 use editor::Editor;
 use feature_flags::FeatureFlagAppExt as _;
-use futures::{channel::oneshot, future::join_all, Future, FutureExt, StreamExt};
+use futures::{future::join_all, StreamExt};
 use gpui::{
-    list, prelude::*, AnyElement, AppContext, AsyncWindowContext, EventEmitter, FocusHandle,
-    FocusableView, Global, ListAlignment, ListState, Model, Render, Task, View, WeakView,
+    list, AnyElement, AppContext, AsyncWindowContext, ClickEvent, EventEmitter, FocusHandle,
+    FocusableView, ListAlignment, ListState, Model, Render, Task, View, WeakView,
 };
 use language::{language_settings::SoftWrap, LanguageRegistry};
 use open_ai::{FunctionContent, ToolCall, ToolCallContent};
-use project::Fs;
 use rich_text::RichText;
-use semantic_index::{CloudEmbeddingProvider, ProjectIndex, SemanticIndex};
+use semantic_index::{CloudEmbeddingProvider, ProjectIndex, ProjectIndexDebugView, SemanticIndex};
 use serde::Deserialize;
 use settings::Settings;
-use std::{cmp, sync::Arc};
-use theme::ThemeSettings;
-use tools::ProjectIndexTool;
-use ui::{popover_menu, prelude::*, ButtonLike, CollapsibleContainer, Color, ContextMenu, Tooltip};
-use util::{paths::EMBEDDINGS_DIR, ResultExt};
+use std::sync::Arc;
+use ui::{ActiveFileButton, Composer, ProjectIndexButton};
+use util::{maybe, paths::EMBEDDINGS_DIR, ResultExt};
 use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     Workspace,
@@ -48,7 +56,7 @@ pub enum SubmitMode {
     Codebase,
 }
 
-gpui::actions!(assistant2, [Cancel, ToggleFocus]);
+gpui::actions!(assistant2, [Cancel, ToggleFocus, DebugProjectIndex]);
 gpui::impl_actions!(assistant2, [Submit]);
 
 pub fn init(client: Arc<Client>, cx: &mut AppContext) {
@@ -78,6 +86,13 @@ pub fn init(client: Arc<Client>, cx: &mut AppContext) {
             workspace.register_action(|workspace, _: &ToggleFocus, cx| {
                 workspace.toggle_panel_focus::<AssistantPanel>(cx);
             });
+            workspace.register_action(|workspace, _: &DebugProjectIndex, cx| {
+                if let Some(panel) = workspace.panel::<AssistantPanel>(cx) {
+                    let index = panel.read(cx).chat.read(cx).project_index.clone();
+                    let view = cx.new_view(|cx| ProjectIndexDebugView::new(index, cx));
+                    workspace.add_item_to_center(Box::new(view), cx);
+                }
+            });
         },
     )
     .detach();
@@ -103,23 +118,35 @@ impl AssistantPanel {
             })?;
 
             cx.new_view(|cx| {
-                // todo!("this will panic if the semantic index failed to load or has not loaded yet")
                 let project_index = cx.update_global(|semantic_index: &mut SemanticIndex, cx| {
                     semantic_index.project_index(project.clone(), cx)
                 });
 
                 let mut tool_registry = ToolRegistry::new();
                 tool_registry
-                    .register(ProjectIndexTool::new(
-                        project_index.clone(),
-                        app_state.fs.clone(),
-                    ))
+                    .register(ProjectIndexTool::new(project_index.clone()), cx)
                     .context("failed to register ProjectIndexTool")
                     .log_err();
+                tool_registry
+                    .register(
+                        CreateBufferTool::new(workspace.clone(), project.clone()),
+                        cx,
+                    )
+                    .context("failed to register CreateBufferTool")
+                    .log_err();
 
-                let tool_registry = Arc::new(tool_registry);
+                let mut attachment_store = AttachmentRegistry::new();
+                attachment_store.register(ActiveEditorAttachmentTool::new(workspace.clone(), cx));
 
-                Self::new(app_state.languages.clone(), tool_registry, cx)
+                Self::new(
+                    app_state.languages.clone(),
+                    Arc::new(tool_registry),
+                    Arc::new(attachment_store),
+                    app_state.user_store.clone(),
+                    project_index,
+                    workspace,
+                    cx,
+                )
             })
         })
     }
@@ -127,10 +154,22 @@ impl AssistantPanel {
     pub fn new(
         language_registry: Arc<LanguageRegistry>,
         tool_registry: Arc<ToolRegistry>,
+        attachment_store: Arc<AttachmentRegistry>,
+        user_store: Model<UserStore>,
+        project_index: Model<ProjectIndex>,
+        workspace: WeakView<Workspace>,
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let chat = cx.new_view(|cx| {
-            AssistantChat::new(language_registry.clone(), tool_registry.clone(), cx)
+            AssistantChat::new(
+                language_registry,
+                tool_registry.clone(),
+                attachment_store,
+                user_store,
+                project_index,
+                workspace,
+                cx,
+            )
         });
 
         Self { width: None, chat }
@@ -142,8 +181,7 @@ impl Render for AssistantPanel {
         div()
             .size_full()
             .v_flex()
-            .p_2()
-            .bg(cx.theme().colors().background)
+            .bg(cx.theme().colors().panel_background)
             .child(self.chat.clone())
     }
 }
@@ -175,8 +213,8 @@ impl Panel for AssistantPanel {
         cx.notify();
     }
 
-    fn icon(&self, _cx: &WindowContext) -> Option<ui::IconName> {
-        Some(IconName::Ai)
+    fn icon(&self, _cx: &WindowContext) -> Option<::ui::IconName> {
+        Some(IconName::ZedAssistant)
     }
 
     fn icon_tooltip(&self, _: &WindowContext) -> Option<&'static str> {
@@ -192,30 +230,42 @@ impl EventEmitter<PanelEvent> for AssistantPanel {}
 
 impl FocusableView for AssistantPanel {
     fn focus_handle(&self, cx: &AppContext) -> FocusHandle {
-        self.chat
-            .read(cx)
-            .messages
-            .iter()
-            .rev()
-            .find_map(|msg| msg.focus_handle(cx))
-            .expect("no user message in chat")
+        self.chat.read(cx).composer_editor.read(cx).focus_handle(cx)
     }
 }
 
-struct AssistantChat {
+pub struct AssistantChat {
     model: String,
     messages: Vec<ChatMessage>,
     list_state: ListState,
     language_registry: Arc<LanguageRegistry>,
+    composer_editor: View<Editor>,
+    project_index_button: View<ProjectIndexButton>,
+    active_file_button: Option<View<ActiveFileButton>>,
+    user_store: Model<UserStore>,
     next_message_id: MessageId,
+    collapsed_messages: HashMap<MessageId, bool>,
+    editing_message: Option<EditingMessage>,
     pending_completion: Option<Task<()>>,
     tool_registry: Arc<ToolRegistry>,
+    attachment_registry: Arc<AttachmentRegistry>,
+    project_index: Model<ProjectIndex>,
+}
+
+struct EditingMessage {
+    id: MessageId,
+    old_body: Arc<str>,
+    body: View<Editor>,
 }
 
 impl AssistantChat {
     fn new(
         language_registry: Arc<LanguageRegistry>,
         tool_registry: Arc<ToolRegistry>,
+        attachment_registry: Arc<AttachmentRegistry>,
+        user_store: Model<UserStore>,
+        project_index: Model<ProjectIndex>,
+        workspace: WeakView<Workspace>,
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let model = CompletionProvider::get(cx).default_model();
@@ -230,17 +280,45 @@ impl AssistantChat {
             },
         );
 
-        let mut this = Self {
+        let project_index_button = cx.new_view(|cx| {
+            ProjectIndexButton::new(project_index.clone(), tool_registry.clone(), cx)
+        });
+
+        let active_file_button = match workspace.upgrade() {
+            Some(workspace) => {
+                Some(cx.new_view(
+                    |cx| ActiveFileButton::new(attachment_registry.clone(), workspace, cx), //
+                ))
+            }
+            _ => None,
+        };
+
+        Self {
             model,
             messages: Vec::new(),
+            composer_editor: cx.new_view(|cx| {
+                let mut editor = Editor::auto_height(80, cx);
+                editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                editor.set_placeholder_text("Send a message…", cx);
+                editor
+            }),
             list_state,
+            user_store,
             language_registry,
+            project_index_button,
+            active_file_button,
+            project_index,
             next_message_id: MessageId(0),
+            editing_message: None,
+            collapsed_messages: HashMap::default(),
             pending_completion: None,
+            attachment_registry,
             tool_registry,
-        };
-        this.push_new_user_message(true, cx);
-        this
+        }
+    }
+
+    fn editing_message_id(&self) -> Option<MessageId> {
+        self.editing_message.as_ref().map(|message| message.id)
     }
 
     fn focused_message_id(&self, cx: &WindowContext) -> Option<MessageId> {
@@ -255,30 +333,89 @@ impl AssistantChat {
     }
 
     fn cancel(&mut self, _: &Cancel, cx: &mut ViewContext<Self>) {
-        if self.pending_completion.take().is_none() {
-            cx.propagate();
+        // If we're currently editing a message, cancel the edit.
+        if let Some(editing_message) = self.editing_message.take() {
+            editing_message
+                .body
+                .update(cx, |body, cx| body.set_text(editing_message.old_body, cx));
             return;
         }
 
-        if let Some(ChatMessage::Assistant(message)) = self.messages.last() {
-            if message.body.text.is_empty() {
-                self.pop_message(cx);
-            } else {
-                self.push_new_user_message(false, cx);
+        if self.pending_completion.take().is_some() {
+            if let Some(ChatMessage::Assistant(message)) = self.messages.last() {
+                if message.body.text.is_empty() {
+                    self.pop_message(cx);
+                }
             }
+            return;
         }
+
+        cx.propagate();
     }
 
     fn submit(&mut self, Submit(mode): &Submit, cx: &mut ViewContext<Self>) {
-        let Some(focused_message_id) = self.focused_message_id(cx) else {
+        if let Some(focused_message_id) = self.focused_message_id(cx) {
+            self.truncate_messages(focused_message_id, cx);
+            self.pending_completion.take();
+            self.composer_editor.focus_handle(cx).focus(cx);
+            if self.editing_message_id() == Some(focused_message_id) {
+                self.editing_message.take();
+            }
+        } else if self.composer_editor.focus_handle(cx).is_focused(cx) {
+            // Don't allow multiple concurrent completions.
+            if self.pending_completion.is_some() {
+                cx.propagate();
+                return;
+            }
+
+            let message = self.composer_editor.update(cx, |composer_editor, cx| {
+                let text = composer_editor.text(cx);
+                let id = self.next_message_id.post_inc();
+                let body = cx.new_view(|cx| {
+                    let mut editor = Editor::auto_height(80, cx);
+                    editor.set_text(text, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                    editor
+                });
+                composer_editor.clear(cx);
+
+                ChatMessage::User(UserMessage {
+                    id,
+                    body,
+                    attachments: Vec::new(),
+                })
+            });
+            self.push_message(message, cx);
+        } else {
             log::error!("unexpected state: no user message editor is focused.");
             return;
-        };
-
-        self.truncate_messages(focused_message_id, cx);
+        }
 
         let mode = *mode;
         self.pending_completion = Some(cx.spawn(move |this, mut cx| async move {
+            let attachments_task = this.update(&mut cx, |this, cx| {
+                let attachment_store = this.attachment_registry.clone();
+                attachment_store.call_all_attachment_tools(cx)
+            });
+
+            let attachments = maybe!(async {
+                let attachments_task = attachments_task?;
+                let attachments = attachments_task.await?;
+
+                anyhow::Ok(attachments)
+            })
+            .await
+            .log_err()
+            .unwrap_or_default();
+
+            // Set the attachments to the _last_ user message
+            this.update(&mut cx, |this, _cx| {
+                if let Some(ChatMessage::User(message)) = this.messages.last_mut() {
+                    message.attachments = attachments;
+                }
+            })
+            .log_err();
+
             Self::request_completion(
                 this.clone(),
                 mode,
@@ -288,13 +425,7 @@ impl AssistantChat {
             .await
             .log_err();
 
-            this.update(&mut cx, |this, cx| {
-                let focus = this
-                    .user_message(focused_message_id)
-                    .body
-                    .focus_handle(cx)
-                    .contains_focused(cx);
-                this.push_new_user_message(focus, cx);
+            this.update(&mut cx, |this, _cx| {
                 this.pending_completion = None;
             })
             .context("Failed to push new user message")
@@ -311,25 +442,34 @@ impl AssistantChat {
         let mut call_count = 0;
         loop {
             let complete = async {
-                let completion = this.update(cx, |this, cx| {
+                let (tool_definitions, model_name, messages) = this.update(cx, |this, cx| {
                     this.push_new_assistant_message(cx);
 
-                    let definitions = if call_count < limit && matches!(mode, SubmitMode::Codebase)
+                    let definitions = if call_count < limit
+                        && matches!(mode, SubmitMode::Codebase | SubmitMode::Simple)
                     {
                         this.tool_registry.definitions()
                     } else {
-                        &[]
+                        Vec::new()
                     };
                     call_count += 1;
 
-                    let messages = this.completion_messages(cx);
-
-                    CompletionProvider::get(cx).complete(
+                    (
+                        definitions,
                         this.model.clone(),
+                        this.completion_messages(cx),
+                    )
+                })?;
+
+                let messages = messages.await?;
+
+                let completion = cx.update(|cx| {
+                    CompletionProvider::get(cx).complete(
+                        model_name,
                         messages,
                         Vec::new(),
                         1.0,
-                        definitions,
+                        tool_definitions,
                     )
                 });
 
@@ -424,36 +564,6 @@ impl AssistantChat {
         }
     }
 
-    fn user_message(&mut self, message_id: MessageId) -> &mut UserMessage {
-        self.messages
-            .iter_mut()
-            .find_map(|message| match message {
-                ChatMessage::User(user_message) if user_message.id == message_id => {
-                    Some(user_message)
-                }
-                _ => None,
-            })
-            .expect("User message not found")
-    }
-
-    fn push_new_user_message(&mut self, focus: bool, cx: &mut ViewContext<Self>) {
-        let id = self.next_message_id.post_inc();
-        let body = cx.new_view(|cx| {
-            let mut editor = Editor::auto_height(80, cx);
-            editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
-            if focus {
-                cx.focus_self();
-            }
-            editor
-        });
-        let message = ChatMessage::User(UserMessage {
-            id,
-            body,
-            contexts: Vec::new(),
-        });
-        self.push_message(message, cx);
-    }
-
     fn push_new_assistant_message(&mut self, cx: &mut ViewContext<Self>) {
         let message = ChatMessage::Assistant(AssistantMessage {
             id: self.next_message_id.post_inc(),
@@ -495,6 +605,15 @@ impl AssistantChat {
         }
     }
 
+    fn is_message_collapsed(&self, id: &MessageId) -> bool {
+        self.collapsed_messages.get(id).copied().unwrap_or_default()
+    }
+
+    fn toggle_message_collapsed(&mut self, id: MessageId) {
+        let entry = self.collapsed_messages.entry(id).or_insert(false);
+        *entry = !*entry;
+    }
+
     fn render_error(
         &self,
         error: Option<SharedString>,
@@ -507,9 +626,9 @@ impl AssistantChat {
             div()
                 .py_1()
                 .px_2()
-                .neg_mx_1()
+                .mx_neg_1()
                 .rounded_md()
-                .border()
+                .border_1()
                 .border_color(theme.status().error_border)
                 // .bg(theme.status().error_background)
                 .text_color(theme.status().error)
@@ -521,25 +640,84 @@ impl AssistantChat {
     }
 
     fn render_message(&self, ix: usize, cx: &mut ViewContext<Self>) -> AnyElement {
+        let is_first = ix == 0;
         let is_last = ix == self.messages.len() - 1;
+
+        let padding = Spacing::Large.rems(cx);
+
+        // Whenever there's a run of assistant messages, group as one Assistant UI element
 
         match &self.messages[ix] {
             ChatMessage::User(UserMessage {
+                id,
                 body,
-                contexts: _contexts,
-                ..
+                attachments,
             }) => div()
-                .when(!is_last, |element| element.mb_2())
-                .child(div().p_2().child(Label::new("You").color(Color::Default)))
-                .child(
-                    div()
-                        .on_action(cx.listener(Self::submit))
-                        .p_2()
-                        .text_color(cx.theme().colors().editor_foreground)
-                        .font(ThemeSettings::get_global(cx).buffer_font.clone())
-                        .bg(cx.theme().colors().editor_background)
-                        .child(body.clone()), // .children(contexts.iter().map(|context| context.render(cx))),
-                )
+                .id(SharedString::from(format!("message-{}-container", id.0)))
+                .when(is_first, |this| this.pt(padding))
+                .map(|element| {
+                    if self.editing_message_id() == Some(*id) {
+                        element.child(Composer::new(
+                            body.clone(),
+                            self.project_index_button.clone(),
+                            self.active_file_button.clone(),
+                            crate::ui::ModelSelector::new(
+                                cx.view().downgrade(),
+                                self.model.clone(),
+                            )
+                            .into_any_element(),
+                        ))
+                    } else {
+                        element
+                            .on_click(cx.listener({
+                                let id = *id;
+                                let body = body.clone();
+                                move |assistant_chat, event: &ClickEvent, cx| {
+                                    if event.up.click_count == 2 {
+                                        assistant_chat.editing_message = Some(EditingMessage {
+                                            id,
+                                            body: body.clone(),
+                                            old_body: body.read(cx).text(cx).into(),
+                                        });
+                                        body.focus_handle(cx).focus(cx);
+                                    }
+                                }
+                            }))
+                            .child(
+                                crate::ui::ChatMessage::new(
+                                    *id,
+                                    UserOrAssistant::User(self.user_store.read(cx).current_user()),
+                                    Some(
+                                        RichText::new(
+                                            body.read(cx).text(cx),
+                                            &[],
+                                            &self.language_registry,
+                                        )
+                                        .element(ElementId::from(id.0), cx),
+                                    ),
+                                    Some(
+                                        h_flex()
+                                            .gap_2()
+                                            .children(
+                                                attachments
+                                                    .iter()
+                                                    .map(|attachment| attachment.view.clone()),
+                                            )
+                                            .into_any_element(),
+                                    ),
+                                    self.is_message_collapsed(id),
+                                    Box::new(cx.listener({
+                                        let id = *id;
+                                        move |assistant_chat, _event, _cx| {
+                                            assistant_chat.toggle_message_collapsed(id)
+                                        }
+                                    })),
+                                )
+                                // TODO: Wire up selections.
+                                .selected(is_last),
+                            )
+                    }
+                })
                 .into_any(),
             ChatMessage::Assistant(AssistantMessage {
                 id,
@@ -548,50 +726,70 @@ impl AssistantChat {
                 tool_calls,
                 ..
             }) => {
-                let assistant_body = if body.text.is_empty() && !tool_calls.is_empty() {
-                    div()
+                let assistant_body = if body.text.is_empty() {
+                    None
                 } else {
-                    div().p_2().child(body.element(ElementId::from(id.0), cx))
+                    Some(
+                        div()
+                            .child(body.element(ElementId::from(id.0), cx))
+                            .into_any_element(),
+                    )
+                };
+
+                let tools = tool_calls
+                    .iter()
+                    .map(|tool_call| self.tool_registry.render_tool_call(tool_call, cx))
+                    .collect::<Vec<AnyElement>>();
+
+                let tools_body = if tools.is_empty() {
+                    None
+                } else {
+                    Some(div().children(tools).into_any_element())
                 };
 
                 div()
-                    .when(!is_last, |element| element.mb_2())
+                    .when(is_first, |this| this.pt(padding))
                     .child(
-                        div()
-                            .p_2()
-                            .child(Label::new("Assistant").color(Color::Modified)),
+                        crate::ui::ChatMessage::new(
+                            *id,
+                            UserOrAssistant::Assistant,
+                            assistant_body,
+                            tools_body,
+                            self.is_message_collapsed(id),
+                            Box::new(cx.listener({
+                                let id = *id;
+                                move |assistant_chat, _event, _cx| {
+                                    assistant_chat.toggle_message_collapsed(id)
+                                }
+                            })),
+                        )
+                        // TODO: Wire up selections.
+                        .selected(is_last),
                     )
-                    .child(assistant_body)
                     .child(self.render_error(error.clone(), ix, cx))
-                    .children(tool_calls.iter().map(|tool_call| {
-                        let result = &tool_call.result;
-                        let name = tool_call.name.clone();
-                        match result {
-                            Some(result) => {
-                                div().p_2().child(result.into_any_element(&name)).into_any()
-                            }
-                            None => div()
-                                .p_2()
-                                .child(Label::new(name).color(Color::Modified))
-                                .child("Running...")
-                                .into_any(),
-                        }
-                    }))
                     .into_any()
             }
         }
     }
 
-    fn completion_messages(&self, cx: &mut WindowContext) -> Vec<CompletionMessage> {
+    fn completion_messages(&self, cx: &mut WindowContext) -> Task<Result<Vec<CompletionMessage>>> {
+        let project_index = self.project_index.read(cx);
+        let project = project_index.project();
+        let fs = project_index.fs();
+
+        let mut project_context = ProjectContext::new(project, fs);
         let mut completion_messages = Vec::new();
 
         for message in &self.messages {
             match message {
-                ChatMessage::User(UserMessage { body, contexts, .. }) => {
-                    // setup context for model
-                    contexts.iter().for_each(|context| {
-                        completion_messages.extend(context.completion_messages(cx))
-                    });
+                ChatMessage::User(UserMessage {
+                    body, attachments, ..
+                }) => {
+                    for attachment in attachments {
+                        if let Some(content) = attachment.generate(&mut project_context, cx) {
+                            completion_messages.push(CompletionMessage::System { content });
+                        }
+                    }
 
                     // Show user's message last so that the assistant is grounded in the user's request
                     completion_messages.push(CompletionMessage::User {
@@ -626,11 +824,11 @@ impl AssistantChat {
                     });
 
                     for tool_call in tool_calls {
-                        // todo!(): we should not be sending when the tool is still running / has no result
-                        // For now I'm going to have to assume we send an empty string because otherwise
-                        // the Chat API will break -- there is a required message for every tool call by ID
+                        // Every tool call _must_ have a result by ID, otherwise OpenAI will error.
                         let content = match &tool_call.result {
-                            Some(result) => result.format(&tool_call.name),
+                            Some(result) => {
+                                result.generate(&tool_call.name, &mut project_context, cx)
+                            }
                             None => "".to_string(),
                         };
 
@@ -643,60 +841,13 @@ impl AssistantChat {
             }
         }
 
-        completion_messages
-    }
+        let system_message = project_context.generate_system_message(cx);
 
-    fn render_model_dropdown(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let this = cx.view().downgrade();
-        div().h_flex().justify_end().child(
-            div().w_32().child(
-                popover_menu("user-menu")
-                    .menu(move |cx| {
-                        ContextMenu::build(cx, |mut menu, cx| {
-                            for model in CompletionProvider::get(cx).available_models() {
-                                menu = menu.custom_entry(
-                                    {
-                                        let model = model.clone();
-                                        move |_| Label::new(model.clone()).into_any_element()
-                                    },
-                                    {
-                                        let this = this.clone();
-                                        move |cx| {
-                                            _ = this.update(cx, |this, cx| {
-                                                this.model = model.clone();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                );
-                            }
-                            menu
-                        })
-                        .into()
-                    })
-                    .trigger(
-                        ButtonLike::new("active-model")
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_0p5()
-                                    .child(
-                                        div()
-                                            .overflow_x_hidden()
-                                            .flex_grow()
-                                            .whitespace_nowrap()
-                                            .child(Label::new(self.model.clone())),
-                                    )
-                                    .child(div().child(
-                                        Icon::new(IconName::ChevronDown).color(Color::Muted),
-                                    )),
-                            )
-                            .style(ButtonStyle::Subtle)
-                            .tooltip(move |cx| Tooltip::text("Change Model", cx)),
-                    )
-                    .anchor(gpui::AnchorCorner::TopRight),
-            ),
-        )
+        cx.background_executor().spawn(async move {
+            let content = system_message.await?;
+            completion_messages.insert(0, CompletionMessage::System { content });
+            Ok(completion_messages)
+        })
     }
 }
 
@@ -707,15 +858,22 @@ impl Render for AssistantChat {
             .flex_1()
             .v_flex()
             .key_context("AssistantChat")
+            .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
             .text_color(Color::Default.color(cx))
-            .child(self.render_model_dropdown(cx))
             .child(list(self.list_state.clone()).flex_1())
+            .child(Composer::new(
+                self.composer_editor.clone(),
+                self.project_index_button.clone(),
+                self.active_file_button.clone(),
+                crate::ui::ModelSelector::new(cx.view().downgrade(), self.model.clone())
+                    .into_any_element(),
+            ))
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-struct MessageId(usize);
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub struct MessageId(usize);
 
 impl MessageId {
     fn post_inc(&mut self) -> Self {
@@ -742,7 +900,7 @@ impl ChatMessage {
 struct UserMessage {
     id: MessageId,
     body: View<Editor>,
-    contexts: Vec<AssistantContext>,
+    attachments: Vec<UserAttachment>,
 }
 
 struct AssistantMessage {
@@ -750,212 +908,4 @@ struct AssistantMessage {
     body: RichText,
     tool_calls: Vec<ToolFunctionCall>,
     error: Option<SharedString>,
-}
-
-// Since we're swapping out for direct query usage, we might not need to use this injected context
-// It will be useful though for when the user _definitely_ wants the model to see a specific file,
-// query, error, etc.
-#[allow(dead_code)]
-enum AssistantContext {
-    Codebase(View<CodebaseContext>),
-}
-
-#[allow(dead_code)]
-struct CodebaseExcerpt {
-    element_id: ElementId,
-    path: SharedString,
-    text: SharedString,
-    score: f32,
-    expanded: bool,
-}
-
-impl AssistantContext {
-    #[allow(dead_code)]
-    fn render(&self, _cx: &mut ViewContext<AssistantChat>) -> AnyElement {
-        match self {
-            AssistantContext::Codebase(context) => context.clone().into_any_element(),
-        }
-    }
-
-    fn completion_messages(&self, cx: &WindowContext) -> Vec<CompletionMessage> {
-        match self {
-            AssistantContext::Codebase(context) => context.read(cx).completion_messages(),
-        }
-    }
-}
-
-enum CodebaseContext {
-    Pending { _task: Task<()> },
-    Done(Result<Vec<CodebaseExcerpt>>),
-}
-
-impl CodebaseContext {
-    fn toggle_expanded(&mut self, element_id: ElementId, cx: &mut ViewContext<Self>) {
-        if let CodebaseContext::Done(Ok(excerpts)) = self {
-            if let Some(excerpt) = excerpts
-                .iter_mut()
-                .find(|excerpt| excerpt.element_id == element_id)
-            {
-                excerpt.expanded = !excerpt.expanded;
-                cx.notify();
-            }
-        }
-    }
-}
-
-impl Render for CodebaseContext {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        match self {
-            CodebaseContext::Pending { .. } => div()
-                .h_flex()
-                .items_center()
-                .gap_1()
-                .child(Icon::new(IconName::Ai).color(Color::Muted).into_element())
-                .child("Searching codebase..."),
-            CodebaseContext::Done(Ok(excerpts)) => {
-                div()
-                    .v_flex()
-                    .gap_2()
-                    .children(excerpts.iter().map(|excerpt| {
-                        let expanded = excerpt.expanded;
-                        let element_id = excerpt.element_id.clone();
-
-                        CollapsibleContainer::new(element_id.clone(), expanded)
-                            .start_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .child(Icon::new(IconName::File).color(Color::Muted))
-                                    .child(Label::new(excerpt.path.clone()).color(Color::Muted)),
-                            )
-                            .on_click(cx.listener(move |this, _, cx| {
-                                this.toggle_expanded(element_id.clone(), cx);
-                            }))
-                            .child(
-                                div()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(cx.theme().colors().editor_background)
-                                    .child(
-                                        excerpt.text.clone(), // todo!(): Show as an editor block
-                                    ),
-                            )
-                    }))
-            }
-            CodebaseContext::Done(Err(error)) => div().child(error.to_string()),
-        }
-    }
-}
-
-impl CodebaseContext {
-    #[allow(dead_code)]
-    fn new(
-        query: impl 'static + Future<Output = Result<String>>,
-        populated: oneshot::Sender<bool>,
-        project_index: Model<ProjectIndex>,
-        fs: Arc<dyn Fs>,
-        cx: &mut ViewContext<Self>,
-    ) -> Self {
-        let query = query.boxed_local();
-        let _task = cx.spawn(|this, mut cx| async move {
-            let result = async {
-                let query = query.await?;
-                let results = this
-                    .update(&mut cx, |_this, cx| {
-                        project_index.read(cx).search(&query, 16, cx)
-                    })?
-                    .await;
-
-                let excerpts = results.into_iter().map(|result| {
-                    let abs_path = result
-                        .worktree
-                        .read_with(&cx, |worktree, _| worktree.abs_path().join(&result.path));
-                    let fs = fs.clone();
-
-                    async move {
-                        let path = result.path.clone();
-                        let text = fs.load(&abs_path?).await?;
-                        // todo!("what should we do with stale ranges?");
-                        let range = cmp::min(result.range.start, text.len())
-                            ..cmp::min(result.range.end, text.len());
-
-                        let text = SharedString::from(text[range].to_string());
-
-                        anyhow::Ok(CodebaseExcerpt {
-                            element_id: ElementId::Name(nanoid::nanoid!().into()),
-                            path: path.to_string_lossy().to_string().into(),
-                            text,
-                            score: result.score,
-                            expanded: false,
-                        })
-                    }
-                });
-
-                anyhow::Ok(
-                    futures::future::join_all(excerpts)
-                        .await
-                        .into_iter()
-                        .filter_map(|result| result.log_err())
-                        .collect(),
-                )
-            }
-            .await;
-
-            this.update(&mut cx, |this, cx| {
-                this.populate(result, populated, cx);
-            })
-            .ok();
-        });
-
-        Self::Pending { _task }
-    }
-
-    #[allow(dead_code)]
-    fn populate(
-        &mut self,
-        result: Result<Vec<CodebaseExcerpt>>,
-        populated: oneshot::Sender<bool>,
-        cx: &mut ViewContext<Self>,
-    ) {
-        let success = result.is_ok();
-        *self = Self::Done(result);
-        populated.send(success).ok();
-        cx.notify();
-    }
-
-    fn completion_messages(&self) -> Vec<CompletionMessage> {
-        // One system message for the whole batch of excerpts:
-
-        // Semantic search results for user query:
-        //
-        // Excerpt from $path:
-        // ~~~
-        // `text`
-        // ~~~
-        //
-        // Excerpt from $path:
-
-        match self {
-            CodebaseContext::Done(Ok(excerpts)) => {
-                if excerpts.is_empty() {
-                    return Vec::new();
-                }
-
-                let mut body = "Semantic search results for user query:\n".to_string();
-
-                for excerpt in excerpts {
-                    body.push_str("Excerpt from ");
-                    body.push_str(excerpt.path.as_ref());
-                    body.push_str(", score ");
-                    body.push_str(&excerpt.score.to_string());
-                    body.push_str(":\n");
-                    body.push_str("~~~\n");
-                    body.push_str(excerpt.text.as_ref());
-                    body.push_str("~~~\n");
-                }
-
-                vec![CompletionMessage::System { content: body }]
-            }
-            _ => vec![],
-        }
-    }
 }

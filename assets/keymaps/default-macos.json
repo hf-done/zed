@@ -159,6 +159,8 @@
       "ctrl-cmd-space": "editor::ShowCharacterPalette",
       "cmd-;": "editor::ToggleLineNumbers",
       "cmd-alt-z": "editor::RevertSelectedHunks",
+      "cmd-'": "editor::ToggleHunkDiff",
+      "cmd-\"": "editor::ExpandAllHunkDiffs",
       "cmd-alt-g b": "editor::ToggleGitBlame"
     }
   },
@@ -576,8 +578,8 @@
       "alt-cmd-shift-c": "project_panel::CopyRelativePath",
       "f2": "project_panel::Rename",
       "enter": "project_panel::Rename",
-      "backspace": "project_panel::Delete",
-      "delete": "project_panel::Delete",
+      "backspace": "project_panel::Trash",
+      "delete": "project_panel::Trash",
       "cmd-backspace": ["project_panel::Delete", { "skip_prompt": true }],
       "cmd-delete": ["project_panel::Delete", { "skip_prompt": true }],
       "alt-cmd-r": "project_panel::RevealInFinder",

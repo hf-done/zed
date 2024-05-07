@@ -20,7 +20,6 @@ members = [
     "crates/command_palette",
     "crates/command_palette_hooks",
     "crates/copilot",
-    "crates/copilot_ui",
     "crates/db",
     "crates/diagnostics",
     "crates/editor",
@@ -36,12 +35,14 @@ members = [
     "crates/fsevent",
     "crates/fuzzy",
     "crates/git",
+    "crates/git_hosting_providers",
     "crates/go_to_line",
     "crates/google_ai",
     "crates/gpui",
     "crates/gpui_macros",
     "crates/headless",
     "crates/image_viewer",
+    "crates/inline_completion_button",
     "crates/install_cli",
     "crates/journal",
     "crates/language",
@@ -69,7 +70,7 @@ members = [
     "crates/refineable",
     "crates/refineable/derive_refineable",
     "crates/release_channel",
-    "crates/remote_projects",
+    "crates/dev_server_projects",
     "crates/rich_text",
     "crates/rope",
     "crates/rpc",
@@ -86,6 +87,8 @@ members = [
     "crates/storybook",
     "crates/sum_tree",
     "crates/tab_switcher",
+    "crates/supermaven",
+    "crates/supermaven_api",
     "crates/terminal",
     "crates/terminal_view",
     "crates/text",
@@ -159,7 +162,6 @@ color = { path = "crates/color" }
 command_palette = { path = "crates/command_palette" }
 command_palette_hooks = { path = "crates/command_palette_hooks" }
 copilot = { path = "crates/copilot" }
-copilot_ui = { path = "crates/copilot_ui" }
 db = { path = "crates/db" }
 diagnostics = { path = "crates/diagnostics" }
 editor = { path = "crates/editor" }
@@ -173,6 +175,7 @@ fs = { path = "crates/fs" }
 fsevent = { path = "crates/fsevent" }
 fuzzy = { path = "crates/fuzzy" }
 git = { path = "crates/git" }
+git_hosting_providers = { path = "crates/git_hosting_providers" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
 gpui = { path = "crates/gpui" }
@@ -180,6 +183,7 @@ gpui_macros = { path = "crates/gpui_macros" }
 headless = { path = "crates/headless" }
 install_cli = { path = "crates/install_cli" }
 image_viewer = { path = "crates/image_viewer" }
+inline_completion_button = { path = "crates/inline_completion_button" }
 journal = { path = "crates/journal" }
 language = { path = "crates/language" }
 language_selector = { path = "crates/language_selector" }
@@ -207,7 +211,7 @@ project_symbols = { path = "crates/project_symbols" }
 quick_action_bar = { path = "crates/quick_action_bar" }
 recent_projects = { path = "crates/recent_projects" }
 release_channel = { path = "crates/release_channel" }
-remote_projects = { path = "crates/remote_projects" }
+dev_server_projects = { path = "crates/dev_server_projects" }
 rich_text = { path = "crates/rich_text" }
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
@@ -220,6 +224,8 @@ settings = { path = "crates/settings" }
 snippet = { path = "crates/snippet" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
+supermaven = { path = "crates/supermaven" }
+supermaven_api = { path = "crates/supermaven_api"}
 story = { path = "crates/story" }
 storybook = { path = "crates/storybook" }
 sum_tree = { path = "crates/sum_tree" }
@@ -250,8 +256,8 @@ async-recursion = "1.0.0"
 async-tar = "0.4.2"
 async-trait = "0.1"
 bitflags = "2.4.2"
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "e82eec97691c3acdb43494484be60d661edfebf3" }
-blade-macros = { git = "https://github.com/kvark/blade", rev = "e82eec97691c3acdb43494484be60d661edfebf3" }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "f5766863de9dcc092e90fdbbc5e0007a99e7f9bf" }
+blade-macros = { git = "https://github.com/kvark/blade", rev = "f5766863de9dcc092e90fdbbc5e0007a99e7f9bf" }
 cap-std = "3.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive"] }
@@ -283,6 +289,8 @@ itertools = "0.11.0"
 lazy_static = "1.4.0"
 linkify = "0.10.0"
 log = { version = "0.4.16", features = ["kv_unstable_serde"] }
+nanoid = "0.4"
+nix = "0.28"
 ordered-float = "2.1.1"
 palette = { version = "0.7.5", default-features = false, features = ["std"] }
 parking_lot = "0.12.1"
@@ -341,7 +349,7 @@ tree-sitter-gowork = { git = "https://github.com/d1y/tree-sitter-go-work" }
 rustc-demangle = "0.1.23"
 tree-sitter-heex = { git = "https://github.com/phoenixframework/tree-sitter-heex", rev = "2e1348c3cf2c9323e87c2744796cf3f3868aa82a" }
 tree-sitter-html = "0.19.0"
-tree-sitter-jsdoc = { git = "https://github.com/tree-sitter/tree-sitter-jsdoc", ref = "6a6cf9e7341af32d8e2b2e24a37fbfebefc3dc55" }
+tree-sitter-jsdoc = { git = "https://github.com/tree-sitter/tree-sitter-jsdoc", rev = "6a6cf9e7341af32d8e2b2e24a37fbfebefc3dc55" }
 tree-sitter-json = { git = "https://github.com/tree-sitter/tree-sitter-json", rev = "40a81c01a40ac48744e0c8ccabbaba1920441199" }
 tree-sitter-markdown = { git = "https://github.com/MDeiml/tree-sitter-markdown", rev = "330ecab87a3e3a7211ac69bbadc19eabecdb1cca" }
 tree-sitter-proto = { git = "https://github.com/rewinfrey/tree-sitter-proto", rev = "36d54f288aee112f13a67b550ad32634d0c2cb52" }
@@ -407,7 +415,7 @@ features = [
 ]
 
 [patch.crates-io]
-tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "528bcd2274814ca53711a57d71d1e3cf7abd73fe" }
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "7b4894ba2ae81b988846676f54c0988d4027ef4f" }
 # Workaround for a broken nightly build of gpui: See #7644 and revisit once 0.5.3 is released.
 pathfinder_simd = { git = "https://github.com/servo/pathfinder.git", rev = "30419d07660dc11a21e42ef4a7fa329600cff152" }
 
