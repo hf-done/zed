@@ -12,8 +12,8 @@ use crate::{
     RenderSvgParams, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubscriberSet, Subscription, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
     TransformationMatrix, Underline, UnderlineStyle, View, VisualContext, WeakView,
-    WindowAppearance, WindowBackgroundAppearance, WindowOptions, WindowParams, WindowTextSystem,
-    SUBPIXEL_VARIANTS,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowOptions, WindowParams,
+    WindowTextSystem, SUBPIXEL_VARIANTS,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::{FxHashMap, FxHashSet};
@@ -50,6 +50,9 @@ use util::{measure, ResultExt};
 mod prompts;
 
 pub use prompts::*;
+
+pub(crate) const DEFAULT_WINDOW_SIZE: Size<DevicePixels> =
+    size(DevicePixels(1024), DevicePixels(700));
 
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
@@ -199,6 +202,18 @@ impl FocusHandle {
     /// Obtains whether this handle contains the given handle in the most recently rendered frame.
     pub fn contains(&self, other: &Self, cx: &WindowContext) -> bool {
         self.id.contains(other.id, cx)
+    }
+
+    /// Dispatch an action on the element that rendered this focus handle
+    pub fn dispatch_action(&self, action: &dyn Action, cx: &mut WindowContext) {
+        if let Some(node_id) = cx
+            .window
+            .rendered_frame
+            .dispatch_tree
+            .focusable_node_id(self.id)
+        {
+            cx.dispatch_action_on_node(node_id, action)
+        }
     }
 }
 
@@ -475,7 +490,15 @@ pub struct Window {
     display_id: DisplayId,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
-    pub(crate) rem_size: Pixels,
+    rem_size: Pixels,
+    /// An override value for the window's rem size.
+    ///
+    /// This is used by `with_rem_size` to allow rendering an element tree with
+    /// a given rem size.
+    ///
+    /// Note: Right now we only allow for a single override value at a time, but
+    /// this could likely be changed to be a stack of rem sizes.
+    rem_size_override: Option<Pixels>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root_view: Option<AnyView>,
@@ -561,11 +584,10 @@ pub(crate) struct ElementStateBox {
 }
 
 fn default_bounds(display_id: Option<DisplayId>, cx: &mut AppContext) -> Bounds<DevicePixels> {
-    const DEFAULT_WINDOW_SIZE: Size<DevicePixels> = size(DevicePixels(1024), DevicePixels(700));
     const DEFAULT_WINDOW_OFFSET: Point<DevicePixels> = point(DevicePixels(0), DevicePixels(35));
 
     cx.active_window()
-        .and_then(|w| w.update(cx, |_, cx| cx.window_bounds()).ok())
+        .and_then(|w| w.update(cx, |_, cx| cx.bounds()).ok())
         .map(|bounds| bounds.map_origin(|origin| origin + DEFAULT_WINDOW_OFFSET))
         .unwrap_or_else(|| {
             let display = display_id
@@ -573,12 +595,7 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut AppContext) -> Bounds<
                 .unwrap_or_else(|| cx.primary_display());
 
             display
-                .map(|display| {
-                    let center = display.bounds().center();
-                    let offset = DEFAULT_WINDOW_SIZE / 2;
-                    let origin = point(center.x - offset.width, center.y - offset.height);
-                    Bounds::new(origin, DEFAULT_WINDOW_SIZE)
-                })
+                .map(|display| display.default_bounds())
                 .unwrap_or_else(|| {
                     Bounds::new(point(DevicePixels(0), DevicePixels(0)), DEFAULT_WINDOW_SIZE)
                 })
@@ -592,19 +609,20 @@ impl Window {
         cx: &mut AppContext,
     ) -> Self {
         let WindowOptions {
-            bounds,
+            window_bounds,
             titlebar,
             focus,
             show,
             kind,
             is_movable,
             display_id,
-            fullscreen,
             window_background,
             app_id,
         } = options;
 
-        let bounds = bounds.unwrap_or_else(|| default_bounds(display_id, cx));
+        let bounds = window_bounds
+            .map(|bounds| bounds.get_bounds())
+            .unwrap_or_else(|| default_bounds(display_id, cx));
         let mut platform_window = cx.platform.open_window(
             handle,
             WindowParams {
@@ -632,8 +650,12 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
 
-        if fullscreen {
-            platform_window.toggle_fullscreen();
+        if let Some(ref window_open_state) = window_bounds {
+            match window_open_state {
+                WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
+                WindowBounds::Maximized(_) => platform_window.zoom(),
+                WindowBounds::Windowed(_) => {}
+            }
         }
 
         platform_window.on_close(Box::new({
@@ -691,7 +713,7 @@ impl Window {
             let mut cx = cx.to_async();
             move |_, _| {
                 handle
-                    .update(&mut cx, |_, cx| cx.window_bounds_changed())
+                    .update(&mut cx, |_, cx| cx.bounds_changed())
                     .log_err();
             }
         }));
@@ -699,7 +721,7 @@ impl Window {
             let mut cx = cx.to_async();
             move || {
                 handle
-                    .update(&mut cx, |_, cx| cx.window_bounds_changed())
+                    .update(&mut cx, |_, cx| cx.bounds_changed())
                     .log_err();
             }
         }));
@@ -749,6 +771,7 @@ impl Window {
             sprite_atlas,
             text_system,
             rem_size: px(16.),
+            rem_size_override: None,
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             root_view: None,
@@ -943,10 +966,10 @@ impl<'a> WindowContext<'a> {
         self.window.platform_window.is_maximized()
     }
 
-    /// Check if the platform window is minimized
-    /// On some platforms (namely Windows) the position is incorrect when minimized
-    pub fn is_minimized(&self) -> bool {
-        self.window.platform_window.is_minimized()
+    /// Return the `WindowBounds` to indicate that how a window should be opened
+    /// after it has been closed
+    pub fn window_bounds(&self) -> WindowBounds {
+        self.window.platform_window.window_bounds()
     }
 
     /// Dispatch the given action on the currently focused element.
@@ -1075,7 +1098,7 @@ impl<'a> WindowContext<'a> {
             .spawn(|app| f(AsyncWindowContext::new(app, self.window.handle)))
     }
 
-    fn window_bounds_changed(&mut self) {
+    fn bounds_changed(&mut self) {
         self.window.scale_factor = self.window.platform_window.scale_factor();
         self.window.viewport_size = self.window.platform_window.content_size();
         self.window.display_id = self.window.platform_window.display().id();
@@ -1088,7 +1111,7 @@ impl<'a> WindowContext<'a> {
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
-    pub fn window_bounds(&self) -> Bounds<DevicePixels> {
+    pub fn bounds(&self) -> Bounds<DevicePixels> {
         self.window.platform_window.bounds()
     }
 
@@ -1124,6 +1147,23 @@ impl<'a> WindowContext<'a> {
     /// Toggle zoom on the window.
     pub fn zoom_window(&self) {
         self.window.platform_window.zoom();
+    }
+
+    /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland only)
+    pub fn show_window_menu(&self, position: Point<Pixels>) {
+        self.window.platform_window.show_window_menu(position)
+    }
+
+    /// Tells the compositor to take control of window movement (Wayland only)
+    ///
+    /// Events may not be received during a move operation.
+    pub fn start_system_move(&self) {
+        self.window.platform_window.start_system_move()
+    }
+
+    /// Returns whether the title bar window controls need to be rendered by the application (Wayland and X11)
+    pub fn should_render_window_controls(&self) -> bool {
+        self.window.platform_window.should_render_window_controls()
     }
 
     /// Updates the window's title at the platform level.
@@ -1171,13 +1211,40 @@ impl<'a> WindowContext<'a> {
     /// The size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
     pub fn rem_size(&self) -> Pixels {
-        self.window.rem_size
+        self.window
+            .rem_size_override
+            .unwrap_or(self.window.rem_size)
     }
 
     /// Sets the size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
     pub fn set_rem_size(&mut self, rem_size: impl Into<Pixels>) {
         self.window.rem_size = rem_size.into();
+    }
+
+    /// Executes the provided function with the specified rem size.
+    ///
+    /// This method must only be called as part of element drawing.
+    pub fn with_rem_size<F, R>(&mut self, rem_size: Option<impl Into<Pixels>>, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        debug_assert!(
+            matches!(
+                self.window.draw_phase,
+                DrawPhase::Prepaint | DrawPhase::Paint
+            ),
+            "this method can only be called during request_layout, prepaint, or paint"
+        );
+
+        if let Some(rem_size) = rem_size {
+            self.window.rem_size_override = Some(rem_size.into());
+            let result = f(self);
+            self.window.rem_size_override.take();
+            result
+        } else {
+            f(self)
+        }
     }
 
     /// The line height associated with the current text style.
@@ -2498,7 +2565,7 @@ impl<'a> WindowContext<'a> {
     /// This method should only be called as part of the request_layout or prepaint phase of element drawing.
     pub fn request_layout(
         &mut self,
-        style: &Style,
+        style: Style,
         children: impl IntoIterator<Item = LayoutId>,
     ) -> LayoutId {
         debug_assert_eq!(

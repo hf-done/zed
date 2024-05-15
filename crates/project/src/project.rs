@@ -69,6 +69,7 @@ use rand::prelude::*;
 use search_history::SearchHistory;
 use worktree::LocalSnapshot;
 
+use http::{HttpClient, Url};
 use rpc::{ErrorCode, ErrorExt as _};
 use search::SearchQuery;
 use serde::Serialize;
@@ -97,11 +98,9 @@ use std::{
 };
 use task::static_source::{StaticSource, TrackedFile};
 use terminals::Terminals;
-use text::{Anchor, BufferId, LineEnding, Rope};
+use text::{Anchor, BufferId, LineEnding};
 use util::{
-    debug_panic, defer,
-    http::{HttpClient, Url},
-    maybe, merge_json_value_into, parse_env_output,
+    debug_panic, defer, maybe, merge_json_value_into, parse_env_output,
     paths::{
         LOCAL_SETTINGS_RELATIVE_PATH, LOCAL_TASKS_RELATIVE_PATH, LOCAL_VSCODE_TASKS_RELATIVE_PATH,
     },
@@ -1003,7 +1002,7 @@ impl Project {
         let fs = Arc::new(RealFs::default());
         let languages = LanguageRegistry::test(cx.background_executor().clone());
         let clock = Arc::new(FakeSystemClock::default());
-        let http_client = util::http::FakeHttpClient::with_404_response();
+        let http_client = http::FakeHttpClient::with_404_response();
         let client = cx
             .update(|cx| client::Client::new(clock, http_client.clone(), cx))
             .unwrap();
@@ -1047,7 +1046,7 @@ impl Project {
 
         let languages = LanguageRegistry::test(cx.executor());
         let clock = Arc::new(FakeSystemClock::default());
-        let http_client = util::http::FakeHttpClient::with_404_response();
+        let http_client = http::FakeHttpClient::with_404_response();
         let client = cx.update(|cx| client::Client::new(clock, http_client.clone(), cx));
         let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
         let project = cx.update(|cx| {
@@ -7537,13 +7536,12 @@ impl Project {
                         .flatten()
                         .chain(current_buffers)
                         .filter_map(|(buffer, path, abs_path)| {
-                            let (work_directory, repo) =
-                                snapshot.repository_and_work_directory_for_path(&path)?;
-                            let repo_entry = snapshot.get_local_repo(&repo)?;
-                            Some((buffer, path, abs_path, work_directory, repo_entry))
+                            let (repo_entry, local_repo_entry) = snapshot.repo_for_path(&path)?;
+                            Some((buffer, path, abs_path, repo_entry, local_repo_entry))
                         })
-                        .map(|(buffer, path, abs_path, work_directory, repo_entry)| {
+                        .map(|(buffer, path, abs_path, repo, local_repo_entry)| {
                             let fs = fs.clone();
+                            let snapshot = snapshot.clone();
                             async move {
                                 let abs_path_metadata = fs
                                     .metadata(&abs_path)
@@ -7558,12 +7556,11 @@ impl Project {
                                 {
                                     None
                                 } else {
-                                    let relative_path = path.strip_prefix(&work_directory).ok()?;
-                                    repo_entry
+                                    let relative_path = repo.relativize(&snapshot, &path).ok()?;
+                                    local_repo_entry
                                         .repo()
                                         .lock()
-                                        .load_index_text(relative_path)
-                                        .map(Rope::from)
+                                        .load_index_text(&relative_path)
                                 };
                                 Some((buffer, base_text))
                             }
@@ -7591,7 +7588,7 @@ impl Project {
                         .send(proto::UpdateDiffBase {
                             project_id,
                             buffer_id,
-                            diff_base: diff_base.map(|rope| rope.to_string()),
+                            diff_base,
                         })
                         .log_err();
                 }
@@ -7658,7 +7655,7 @@ impl Project {
                                 abs_path,
                                 id_base: "local_tasks_for_worktree",
                             },
-                            StaticSource::new(TrackedFile::new(tasks_file_rx, cx)),
+                            |tx, cx| StaticSource::new(TrackedFile::new(tasks_file_rx, tx, cx)),
                             cx,
                         );
                     }
@@ -7678,12 +7675,13 @@ impl Project {
                                 abs_path,
                                 id_base: "local_vscode_tasks_for_worktree",
                             },
-                            StaticSource::new(
-                                TrackedFile::new_convertible::<task::VsCodeTaskFile>(
-                                    tasks_file_rx,
-                                    cx,
-                                ),
-                            ),
+                            |tx, cx| {
+                                StaticSource::new(TrackedFile::new_convertible::<
+                                    task::VsCodeTaskFile,
+                                >(
+                                    tasks_file_rx, tx, cx
+                                ))
+                            },
                             cx,
                         );
                     }
@@ -7868,6 +7866,18 @@ impl Project {
         })
     }
 
+    pub fn project_path_for_absolute_path(
+        &self,
+        abs_path: &Path,
+        cx: &AppContext,
+    ) -> Option<ProjectPath> {
+        self.find_local_worktree(abs_path, cx)
+            .map(|(worktree, relative_path)| ProjectPath {
+                worktree_id: worktree.read(cx).id(),
+                path: relative_path.into(),
+            })
+    }
+
     pub fn get_workspace_root(
         &self,
         project_path: &ProjectPath,
@@ -7893,6 +7903,16 @@ impl Project {
             .local_git_repo(&project_path.path)
     }
 
+    pub fn get_first_worktree_root_repo(
+        &self,
+        cx: &AppContext,
+    ) -> Option<Arc<Mutex<dyn GitRepository>>> {
+        let worktree = self.visible_worktrees(cx).next()?.read(cx).as_local()?;
+        let root_entry = worktree.root_git_entry()?;
+
+        worktree.get_local_repo(&root_entry)?.repo().clone().into()
+    }
+
     pub fn blame_buffer(
         &self,
         buffer: &Model<Buffer>,
@@ -7914,24 +7934,17 @@ impl Project {
                     .context("worktree was not local")?
                     .snapshot();
 
-                let (work_directory, repo) = match worktree
-                    .repository_and_work_directory_for_path(&buffer_project_path.path)
-                {
-                    Some(work_dir_repo) => work_dir_repo,
-                    None => anyhow::bail!(NoRepositoryError {}),
-                };
+                let (repo_entry, local_repo_entry) =
+                    match worktree.repo_for_path(&buffer_project_path.path) {
+                        Some(repo_for_path) => repo_for_path,
+                        None => anyhow::bail!(NoRepositoryError {}),
+                    };
 
-                let repo_entry = match worktree.get_local_repo(&repo) {
-                    Some(repo_entry) => repo_entry,
-                    None => anyhow::bail!(NoRepositoryError {}),
-                };
+                let relative_path = repo_entry
+                    .relativize(&worktree, &buffer_project_path.path)
+                    .context("failed to relativize buffer path")?;
 
-                let repo = repo_entry.repo().clone();
-
-                let relative_path = buffer_project_path
-                    .path
-                    .strip_prefix(&work_directory)?
-                    .to_path_buf();
+                let repo = local_repo_entry.repo().clone();
 
                 let content = match version {
                     Some(version) => buffer.rope_for_version(&version).clone(),
@@ -7945,7 +7958,7 @@ impl Project {
                 let (repo, relative_path, content) = blame_params?;
                 let lock = repo.lock();
                 lock.blame(&relative_path, content)
-                    .with_context(|| format!("Failed to blame {relative_path:?}"))
+                    .with_context(|| format!("Failed to blame {:?}", relative_path.0))
             })
         } else {
             let project_id = self.remote_id();
@@ -8666,14 +8679,15 @@ impl Project {
         this.update(&mut cx, |this, cx| {
             let buffer_id = envelope.payload.buffer_id;
             let buffer_id = BufferId::new(buffer_id)?;
-            let diff_base = envelope.payload.diff_base.map(Rope::from);
             if let Some(buffer) = this
                 .opened_buffers
                 .get_mut(&buffer_id)
                 .and_then(|b| b.upgrade())
                 .or_else(|| this.incomplete_remote_buffers.get(&buffer_id).cloned())
             {
-                buffer.update(cx, |buffer, cx| buffer.set_diff_base(diff_base, cx));
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_diff_base(envelope.payload.diff_base, cx)
+                });
             }
             Ok(())
         })?

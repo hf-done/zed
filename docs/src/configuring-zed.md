@@ -186,6 +186,38 @@ left and right padding of the central pane from the workspace when the centered 
 
 List of `string` values
 
+## Current Line Highlight
+
+- Description: How to highlight the current line in the editor.
+- Setting: `current_line_highlight`
+- Default: `all`
+
+**Options**
+
+1. Don't highlight the current line:
+
+```json
+"current_line_highlight": "none"
+```
+
+2. Highlight the gutter area.
+
+```json
+"current_line_highlight": "gutter"
+```
+
+3. Highlight the editor area.
+
+```json
+"current_line_highlight": "line"
+```
+
+4. Highlight the full line.
+
+```json
+"current_line_highlight": "all"
+```
+
 ## Cursor Blink
 
 - Description: Whether or not the cursor blinks.
@@ -315,6 +347,82 @@ List of `string` values
 
 `boolean` values
 
+## Editor Tab Bar
+
+- Description: Settings related to the editor's tab bar.
+- Settings: `tab_bar`
+- Default:
+
+```json
+"tab_bar": {
+  "show": true,
+  "show_nav_history_buttons": true
+}
+```
+
+### Show
+
+- Description: Whether or not to show the tab bar in the editor.
+- Setting: `show`
+- Default: `true`
+
+**Options**
+
+`boolean` values
+
+### Navigation History Buttons
+
+- Description: Whether or not to show the navigation history buttons.
+- Setting: `show_nav_history_buttons`
+- Default: `true`
+
+**Options**
+
+`boolean` values
+
+## Editor Tabs
+
+- Description: Configuration for the editor tabs.
+- Setting: `tabs`
+- Default:
+
+```json
+"tabs": {
+  "close_position": "right",
+  "git_status": false
+},
+```
+
+### Close Position
+
+- Description: Where to display close button within a tab.
+- Setting: `close_position`
+- Default: `right`
+
+**Options**
+
+1. Display the close button on the right:
+
+```json
+{
+  "close_position": "right"
+}
+```
+
+2. Display the close button on the left:
+
+```json
+{
+  "close_position": "left"
+}
+```
+
+### Git Status
+
+- Description: Whether or not to show Git file status in tab.
+- Setting: `git_status`
+- Default: `false`
+
 ## Editor Toolbar
 
 - Description: Whether or not to show various elements in the editor toolbar.
@@ -406,7 +514,7 @@ To override settings for a language, add an entry for that language server's nam
 
 - Description: How to perform a buffer format.
 - Setting: `formatter`
-- Default: `language_server`
+- Default: `auto`
 
 **Options**
 
